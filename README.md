@@ -1,4 +1,4 @@
-# SO Deploy
+# Sodaploy
 
 Deploy a website from a local folder to your Cloudflare domain with one command:
 
@@ -6,8 +6,6 @@ Deploy a website from a local folder to your Cloudflare domain with one command:
 cd my-app
 so
 ```
-
-
 
 https://github.com/user-attachments/assets/191e9d84-3788-4c12-8491-020274947d54
 
