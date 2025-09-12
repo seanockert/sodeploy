@@ -1,4 +1,4 @@
-# Sodaploy
+# So Deploy
 
 Deploy a website from a local folder to your Cloudflare domain with one command:
 
@@ -25,6 +25,14 @@ To remove the site and subdomain, simply run `so teardown`
 A domain hosted on Cloudflare.
 
 ## Install
+
+### Via Homebrew:
+
+```bash
+brew install seanockert/sodeploy/sodeploy
+```
+
+### Or download the `so` file from this repo:
 
 ```bash
 # Install the script by moving it to /usr/local/bin/ 
