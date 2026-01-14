@@ -1,4 +1,4 @@
-# So Deploy
+# SO Deploy
 
 Deploy a website from a local folder to your Cloudflare domain with one command:
 
@@ -8,8 +8,6 @@ so
 ```
 
 https://github.com/user-attachments/assets/191e9d84-3788-4c12-8491-020274947d54
-
-
 
 
 ## What and why
@@ -22,75 +20,75 @@ To remove the site and subdomain, simply run `so teardown`
 
 ## Requirements
 
-A domain hosted on Cloudflare.
+- A domain hosted on Cloudflare
+- macOS, Linux, or Windows (Git Bash)
 
-## Install
+## Quick Start
 
-### Via Homebrew:
+### 1. Install
 
+**macOS/Linux** (requires sudo):
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/install.sh)"
+```
+
+**Or via Homebrew** (macOS):
 ```bash
 brew install seanockert/sodeploy/sodeploy
 ```
 
-### Or download the `so` file from this repo:
+The installer will automatically run `so setup` to configure your Cloudflare credentials.
+
+### 2. Configure Cloudflare
+
+Before running setup, create an API token in your [Cloudflare dashboard](https://dash.cloudflare.com/profile/api-tokens) with these permissions:
+- Account: Worker Scripts: Edit
+- Zone: Zone: Edit
+- Zone: DNS: Edit
+- Zone: Workers Routes: Edit
+
+During setup, you'll need:
+- API Token (the one you just created)
+- Account ID (found in account home settings)
+- Zone ID (found in domain settings)
+- Base domain (e.g., `mydomain.com`)
+
+If you skipped setup during installation, run `so setup` anytime.
+
+## Manual Installation
+
+If you prefer to install manually:
 
 ```bash
-# Install the script by moving it to /usr/local/bin/ 
+# Download the script
+curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/so -o so
+
+# Install to /usr/local/bin
 sudo mv so /usr/local/bin/
+sudo chmod +x /usr/local/bin/so
 
-# Give it the right permissions
-chmod +x /usr/local/bin/so
+# Install dependencies
+# macOS:
+brew install jq
 
-# Install dependencies: curl (probably have already) and jq
-brew install jq curl
+# Linux (Ubuntu/Debian):
+sudo apt install jq
+
+# Linux (CentOS/RHEL):
+sudo yum install jq
 ```
 
-## Setup
-
-### 1. Create an API token with the following permissions: 
-  - Account: Worker Scripts: Edit
-  - Zone: Zone: Edit
-  - Zone: DNS: Edit
-  - Zone: Workers Routes: Edit
-
-### 2. Run setup
+## Usage
 
 ```bash
-# Run the setup
-so setup
+so                    # Deploy current folder
+so -d <name>          # Deploy with custom subdomain
+so list               # List all deployed sites
+so teardown           # Delete current folder's site
+so teardown <name>    # Delete specific site
+so setup              # Configure Cloudflare credentials
 ```
 
-You'll need the following Cloudflare credentials:
+## Windows Support
 
-1. The API token you just created
-2. Account ID (account home settings -> Copy account ID)
-3. Zone ID (domain settings -> Copy zone ID)
-4. Base domain (eg. mydomain.com)
-
-## Available commands
-
-```bash
-# Deploy current folder
-so
-
-# Deploy with custom subdomain
-so -d <name> 
-
-# List all deployed sites
-so list
-
-# Delete current folder's site
-so teardown
-
-# Delete specific site
-so teardown <name>
-
-# Configure Cloudflare credential
-so setup
-```
-
-## Windows support
-
-Not tested on Windows yet but it should work fine. Runs via Git Bash. 
-
-When you run the `./so setup` command it will prompt you to install the `jq` dependency.
+Works on Windows via Git Bash. The installer will automatically download `jq` for Windows during installation.
