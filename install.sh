@@ -46,7 +46,7 @@ install_jq() {
     command -v jq >/dev/null 2>&1 && return
     
     local os=$(detect_os)
-    echo -e "${YELLOW}📦 Installing jq...${NC}"
+    echo -e "${YELLOW}Installing jq...${NC}"
 
     case "$os" in
         darwin)
@@ -85,7 +85,7 @@ install_jq() {
 }
 
 install_so() {
-    echo -e "${YELLOW}📥 Installing so...${NC}"
+    echo -e "${YELLOW}Installing so...${NC}"
     mkdir -p "$INSTALL_DIR"
     curl -fsSL "$GITHUB_URL" -o "$INSTALL_PATH" || {
         echo -e "${RED}❌ Download failed${NC}"
@@ -95,7 +95,7 @@ install_so() {
 }
 
 main() {
-    echo "🚀 Installing So Deploy..."
+    echo "Installing SO Deploy..."
     echo
     
     check_curl
@@ -112,7 +112,7 @@ main() {
         return
     fi
     
-    echo "🔧 Running setup..."
+    echo "Running setup..."
     set +e
     so setup
     local exit_code=$?

@@ -12,11 +12,11 @@ https://github.com/user-attachments/assets/191e9d84-3788-4c12-8491-020274947d54
 
 ## What and why
 
-I use [surge.sh](https://surge.sh/) to quickly deploy web projects for sharing and testing. SO Deploy does the same but using your own domain. I made it to scratch my own itch.
+I use [surge.sh](https://surge.sh/) to quickly deploy web projects for sharing and testing. SO Deploy uses your own domain to do the same.
 
 When you run the `so` command in a local folder, it creates a new public subdomain (eg. `https://my-folder.my-domain.com`) and deploys the contents of that folder to it within seconds.
 
-To remove the site and subdomain, simply run `so teardown`
+To remove the subdomain, run `so teardown`
 
 ## Requirements
 
@@ -27,7 +27,7 @@ To remove the site and subdomain, simply run `so teardown`
 
 ### 1. Install
 
-**macOS/Linux** (requires sudo):
+**macOS/Linux**:
 ```bash
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/install.sh)"
 ```
@@ -55,29 +55,6 @@ During setup, you'll need:
 
 If you skipped setup during installation, run `so setup` anytime.
 
-## Manual Installation
-
-If you prefer to install manually:
-
-```bash
-# Download the script
-curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/so -o so
-
-# Install to /usr/local/bin
-sudo mv so /usr/local/bin/
-sudo chmod +x /usr/local/bin/so
-
-# Install dependencies
-# macOS:
-brew install jq
-
-# Linux (Ubuntu/Debian):
-sudo apt install jq
-
-# Linux (CentOS/RHEL):
-sudo yum install jq
-```
-
 ## Usage
 
 ```bash
@@ -88,7 +65,7 @@ so teardown           # Delete current folder's site
 so teardown <name>    # Delete specific site
 so setup              # Configure Cloudflare credentials
 ```
-
 ## Windows Support
 
 Works on Windows via Git Bash. The installer will automatically download `jq` for Windows during installation.
+

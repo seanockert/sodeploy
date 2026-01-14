@@ -4,8 +4,21 @@
 CONFIG_DIR="$HOME/.config/so"
 CONFIG_FILE="$CONFIG_DIR/config"
 
+# Detect OS
+detect_os() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "darwin"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        echo "linux"
+    elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+        echo "windows"
+    else
+        echo "unknown"
+    fi
+}
+
 # Extract subdomain from various formats
-normalize_subdomain() {
+normalise_subdomain() {
     local input="$1"
     local subdomain
 
@@ -39,38 +52,40 @@ check_dependencies() {
 
     # Check jq
     if ! command -v jq >/dev/null 2>&1; then
-        echo "📦 jq not found. Installing jq..."
+        echo "jq not found. Installing jq..."
 
-        # Detect OS and install jq
-        if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
-            # Windows (Git Bash)
-            echo "🪟 Detected Windows/Git Bash. Installing jq..."
-            curl -L -o /usr/bin/jq.exe https://github.com/stedolan/jq/releases/latest/download/jq-win64.exe 2>/dev/null
-            chmod +x /usr/bin/jq.exe
-        elif [[ "$OSTYPE" == "darwin"* ]]; then
-            # macOS
-            if command -v brew >/dev/null 2>&1; then
-                echo "🍺 Installing jq via Homebrew..."
+        local os=$(detect_os)
+        case "$os" in
+            darwin)
+                command -v brew >/dev/null 2>&1 || {
+                    echo "❌ Homebrew required: https://brew.sh"
+                    exit 1
+                }
                 brew install jq
-            else
-                echo "❌ Please install Homebrew first, then run: brew install jq"
+                ;;
+            linux)
+                echo "Please install jq:"
+                echo "  Ubuntu/Debian: sudo apt install jq"
+                echo "  CentOS/RHEL: sudo yum install jq"
+                echo "  Fedora: sudo dnf install jq"
                 exit 1
-            fi
-        else
-            # Linux
-            echo "🐧 Please install jq:"
-            echo "  Ubuntu/Debian: sudo apt install jq"
-            echo "  CentOS/RHEL: sudo yum install jq"
-            exit 1
-        fi
+                ;;
+            windows)
+                curl -fsSL -o /usr/bin/jq.exe https://github.com/stedolan/jq/releases/latest/download/jq-win64.exe
+                chmod +x /usr/bin/jq.exe
+                ;;
+            *)
+                echo "❌ Unsupported OS"
+                exit 1
+                ;;
+        esac
 
         # Verify installation
-        if command -v jq >/dev/null 2>&1; then
-            echo "✅ jq installed successfully"
-        else
+        command -v jq >/dev/null 2>&1 || {
             echo "❌ jq installation failed"
             exit 1
-        fi
+        }
+        echo "✅ jq installed successfully"
     fi
 
     # Check for other missing dependencies
@@ -197,7 +212,7 @@ generate_files_json() {
            '.[$path] = {"content": $content, "mimeType": $mime}' \
            "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
 
-        echo "  📄 $rel_path" >&2
+        echo "  $rel_path" >&2
 
     done < <(find "$dir" -type f -print0)
 
@@ -321,7 +336,7 @@ ensure_dns_record() {
     count=$(echo "$existing" | jq -r '.result | length')
 
     if [[ "$count" == "0" ]]; then
-        echo "🌐 Creating DNS record..."
+        echo "Creating DNS record..."
 
         local create_response
         create_response=$(curl -s -X POST \
@@ -340,7 +355,7 @@ ensure_dns_record() {
 
 # Purge cache
 purge_cache() {
-    echo "🔄 Purging cache..."
+    echo "Purging cache..."
     curl -s -X POST \
         "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
         -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -354,7 +369,7 @@ list_sites() {
     check_dependencies
     load_config
 
-    echo "📋 Fetching deployed sites..."
+    echo "Fetching deployed sites..."
 
     local response
     response=$(curl -s -X GET \
@@ -369,7 +384,7 @@ list_sites() {
         return
     fi
 
-    echo "🌐 Deployed sites:"
+    echo "Deployed sites:"
     while IFS= read -r worker_name; do
         local subdomain="${worker_name#$WORKER_NAME_PREFIX}"
         echo "  https://$subdomain.$BASE_DOMAIN"
@@ -385,12 +400,12 @@ deploy() {
     local current_dir="$(pwd)"
     local folder_name="$(basename "$current_dir")"
 
-    # Use folder name if no subdomain specified, otherwise normalize the input
+    # Use folder name if no subdomain specified, otherwise normalise the input
     local subdomain
     if [[ -z "$subdomain_input" ]]; then
         subdomain="$folder_name"
     else
-        subdomain=$(normalize_subdomain "$subdomain_input")
+        subdomain=$(normalise_subdomain "$subdomain_input")
     fi
 
     local worker_name="$WORKER_NAME_PREFIX$subdomain"
@@ -436,8 +451,8 @@ teardown() {
         local folder_name="$(basename "$(pwd)")"
         subdomain="$folder_name"
     else
-        # Normalize the input to extract subdomain
-        subdomain=$(normalize_subdomain "$subdomain_input")
+        # Normalise the input to extract subdomain
+        subdomain=$(normalise_subdomain "$subdomain_input")
     fi
 
     local worker_name="$WORKER_NAME_PREFIX$subdomain"
