@@ -29,7 +29,14 @@ To remove it, run `so teardown`.
 
 **macOS/Linux**:
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/install.sh)"
+```
+
+The installer asks for sudo only if it needs it to write to `/usr/local/bin`.
+To avoid sudo completely, pick a directory you own:
+
+```bash
+INSTALL_DIR="$HOME/.local/bin" bash -c "$(curl -fsSL https://raw.githubusercontent.com/seanockert/sodeploy/main/install.sh)"
 ```
 
 **Or via Homebrew** (macOS):
