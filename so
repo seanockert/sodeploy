@@ -1,8 +1,34 @@
 #!/bin/bash
+set -uo pipefail
 
 # Configuration - set these in ~/.config/so/config or as environment variables
 CONFIG_DIR="$HOME/.config/so"
 CONFIG_FILE="$CONFIG_DIR/config"
+
+CF_API="https://api.cloudflare.com/client/v4"
+# Pinned so redeploys keep the same runtime behaviour
+WORKER_COMPAT_DATE="2025-01-01"
+# Free plan worker limit is 1MB, paid is 10MB
+WORKER_WARN_BYTES=1000000
+WORKER_MAX_BYTES=10000000
+
+# Temp files to remove on exit
+TMP_FILES=()
+
+cleanup() {
+    [[ ${#TMP_FILES[@]} -gt 0 ]] && rm -f "${TMP_FILES[@]}"
+    return 0
+}
+trap cleanup EXIT
+
+# Makes a temp file and puts the path in TMP_FILE.
+# Sets a variable instead of printing, because a command substitution
+# would run in a subshell and lose the TMP_FILES entry.
+TMP_FILE=""
+new_tmp() {
+    TMP_FILE=$(mktemp) || exit 1
+    TMP_FILES+=("$TMP_FILE")
+}
 
 # Detect OS
 detect_os() {
@@ -17,92 +43,72 @@ detect_os() {
     fi
 }
 
-# Extract subdomain from various formats
-normalise_subdomain() {
-    local input="$1"
-    local subdomain
-
-    # Remove https:// or http:// prefix
-    input="${input#https://}"
-    input="${input#http://}"
-
-    # Remove trailing slash
-    input="${input%/}"
-
-    # Check if it contains the base domain
-    if [[ "$input" == *".$BASE_DOMAIN"* ]]; then
-        # Extract subdomain part (everything before .BASE_DOMAIN)
-        subdomain="${input%%.$BASE_DOMAIN*}"
-    else
-        # Assume it's already just the subdomain
-        subdomain="$input"
-    fi
-
-    echo "$subdomain"
-}
-
 # Check and install dependencies
 check_dependencies() {
-    local missing=()
-
-    # Check curl
+    # curl is needed to install anything else, so check it first
     if ! command -v curl >/dev/null 2>&1; then
-        missing+=("curl")
-    fi
-
-    # Check jq
-    if ! command -v jq >/dev/null 2>&1; then
-        echo "jq not found. Installing jq..."
-
-        local os=$(detect_os)
-        case "$os" in
-            darwin)
-                command -v brew >/dev/null 2>&1 || {
-                    echo "❌ Homebrew required: https://brew.sh"
-                    exit 1
-                }
-                brew install jq
-                ;;
-            linux)
-                echo "Please install jq:"
-                echo "  Ubuntu/Debian: sudo apt install jq"
-                echo "  CentOS/RHEL: sudo yum install jq"
-                echo "  Fedora: sudo dnf install jq"
-                exit 1
-                ;;
-            windows)
-                curl -fsSL -o /usr/bin/jq.exe https://github.com/stedolan/jq/releases/latest/download/jq-win64.exe
-                chmod +x /usr/bin/jq.exe
-                ;;
-            *)
-                echo "❌ Unsupported OS"
-                exit 1
-                ;;
-        esac
-
-        # Verify installation
-        command -v jq >/dev/null 2>&1 || {
-            echo "❌ jq installation failed"
-            exit 1
-        }
-        echo "✅ jq installed successfully"
-    fi
-
-    # Check for other missing dependencies
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo "❌ Missing required dependencies: ${missing[*]}"
-        echo "Please install them and try again."
+        echo "❌ Missing required dependency: curl"
+        echo "Please install it and try again."
         exit 1
     fi
+
+    command -v jq >/dev/null 2>&1 && return 0
+
+    echo "jq not found. Installing jq..."
+    case "$(detect_os)" in
+        darwin)
+            command -v brew >/dev/null 2>&1 || {
+                echo "❌ Homebrew required: https://brew.sh"
+                exit 1
+            }
+            brew install jq
+            ;;
+        linux)
+            echo "Please install jq:"
+            echo "  Ubuntu/Debian: sudo apt install jq"
+            echo "  CentOS/RHEL: sudo yum install jq"
+            echo "  Fedora: sudo dnf install jq"
+            exit 1
+            ;;
+        windows)
+            curl -fsSL -o /usr/bin/jq.exe https://github.com/stedolan/jq/releases/latest/download/jq-win64.exe
+            chmod +x /usr/bin/jq.exe
+            ;;
+        *)
+            echo "❌ Unsupported OS"
+            exit 1
+            ;;
+    esac
+
+    command -v jq >/dev/null 2>&1 || {
+        echo "❌ jq installation failed"
+        exit 1
+    }
+    echo "✅ jq installed successfully"
 }
 
 # Load configuration
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
+
+        # The config holds an API token, so keep it private
+        local perms
+        perms=$(ls -l "$CONFIG_FILE" | cut -c5-10)
+        if [[ "$perms" != "------" ]]; then
+            chmod 600 "$CONFIG_FILE"
+            echo "Tightened permissions on $CONFIG_FILE (it holds your API token)"
+        fi
     fi
 
-    # Check required variables
+    # An empty prefix would match every worker in the account, so never allow one
+    WORKER_NAME_PREFIX="${WORKER_NAME_PREFIX:-site-}"
+
+    CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+    CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
+    CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
+    BASE_DOMAIN="${BASE_DOMAIN:-}"
+
     if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" || -z "$CLOUDFLARE_ZONE_ID" || -z "$BASE_DOMAIN" ]]; then
         echo "❌ Missing configuration. Run: so setup"
         exit 1
@@ -120,12 +126,18 @@ setup_config() {
     echo "4. Your base domain"
     echo
 
-    read -p "Cloudflare API Token: " api_token
-    read -p "Cloudflare Account ID: " account_id
-    read -p "Cloudflare Zone ID: " zone_id
-    read -p "Base domain (e.g., mydomain.com): " base_domain
+    # Token is secret, so do not echo it to the screen
+    read -r -s -p "Cloudflare API Token: " api_token
+    echo
+    read -r -p "Cloudflare Account ID: " account_id
+    read -r -p "Cloudflare Zone ID: " zone_id
+    read -r -p "Base domain (e.g., mydomain.com): " base_domain
 
     mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    local old_umask
+    old_umask=$(umask)
+    umask 077
     cat > "$CONFIG_FILE" << EOF
 CLOUDFLARE_API_TOKEN="$api_token"
 CLOUDFLARE_ACCOUNT_ID="$account_id"
@@ -133,6 +145,8 @@ CLOUDFLARE_ZONE_ID="$zone_id"
 BASE_DOMAIN="$base_domain"
 WORKER_NAME_PREFIX="site-"
 EOF
+    umask "$old_umask"
+    chmod 600 "$CONFIG_FILE"
 
     echo "✅ Configuration saved to $CONFIG_FILE"
     echo
@@ -143,174 +157,270 @@ EOF
     echo "  so teardown           # Delete current folder's site"
 }
 
-# Generate files JSON for worker using jq for proper escaping
+# Call the Cloudflare API. Always prints one JSON object.
+cf_api() {
+    local out rc
+    out=$(curl -s --max-time 120 --retry 3 --retry-delay 1 \
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$@" 2>&1)
+    rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        jq -n --arg msg "network error (curl exit $rc)" \
+            '{success: false, errors: [{message: $msg}]}'
+        return 0
+    fi
+
+    if ! echo "$out" | jq -e . >/dev/null 2>&1; then
+        jq -n --arg msg "unreadable response from Cloudflare" \
+            '{success: false, errors: [{message: $msg}]}'
+        return 0
+    fi
+
+    printf '%s' "$out"
+}
+
+# Check a Cloudflare API response succeeded
+api_ok() {
+    echo "$1" | jq -e '(.success == true) or (.result.id? // empty | length > 0)' >/dev/null 2>&1
+}
+
+# Report why a Cloudflare API call failed
+api_error() {
+    echo "$1" | jq -r '[.errors[]?.message] | if length > 0 then join("; ") else "unknown error" end' 2>/dev/null \
+        || echo "unknown error"
+}
+
+# Fetch every page of a list endpoint. Prints the combined result array.
+cf_list_all() {
+    local url="$1" page=1 out="[]" sep response items total
+    while :; do
+        sep="?"
+        [[ "$url" == *"?"* ]] && sep="&"
+        response=$(cf_api -X GET "${url}${sep}page=${page}&per_page=50")
+        api_ok "$response" || { api_error "$response" >&2; return 1; }
+
+        items=$(echo "$response" | jq -c '.result // []')
+        out=$(jq -cn --argjson a "$out" --argjson b "$items" '$a + $b')
+
+        # No result_info means the endpoint returns everything in one page
+        total=$(echo "$response" | jq -r '.result_info.total_count // empty')
+        [[ -z "$total" ]] && break
+        [[ $(echo "$items" | jq 'length') -eq 0 ]] && break
+        [[ $(echo "$out" | jq 'length') -ge $total ]] && break
+        page=$((page + 1))
+    done
+    echo "$out"
+}
+
+# Make a name safe for a hostname and a worker name
+slugify() {
+    # LC_ALL=C so multi-byte characters are replaced byte by byte, not passed through
+    LC_ALL=C; export LC_ALL
+    echo "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9-]/-/g' -e 's/--*/-/g' -e 's/^-*//' -e 's/-*$//'
+}
+
+# Work out the subdomain from user input, or from the current folder
+resolve_subdomain() {
+    local input="$1" name slug
+
+    if [[ -z "$input" ]]; then
+        input="$(basename "$(pwd)")"
+    fi
+
+    # Strip scheme, trailing slash and the base domain
+    name="${input#https://}"
+    name="${name#http://}"
+    name="${name%/}"
+    if [[ "$name" == *".$BASE_DOMAIN"* ]]; then
+        name="${name%%.$BASE_DOMAIN*}"
+    fi
+
+    slug=$(slugify "$name")
+
+    if [[ -z "$slug" ]]; then
+        echo "❌ Cannot build a valid subdomain from '$input'" >&2
+        exit 1
+    fi
+    if [[ ! "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+        echo "❌ Invalid subdomain '$slug'" >&2
+        exit 1
+    fi
+    if [[ ${#slug} -gt 63 ]]; then
+        echo "❌ Subdomain is longer than 63 characters: $slug" >&2
+        exit 1
+    fi
+    if [[ "$slug" != "$name" ]]; then
+        echo "Using subdomain '$slug' (from '$name')" >&2
+    fi
+
+    echo "$slug"
+}
+
+# List deployable files under $1, NUL separated.
+# Hidden files and node_modules are pruned at every depth, not just the top.
+collect_files() {
+    find "$1" -mindepth 1 \
+        \( -name '.*' -o -name 'node_modules' \) -prune -o \
+        -type f -print0
+}
+
+# Work out a mime type for a file
+mime_type() {
+    local file="$1" detected
+    case "${file##*.}" in
+        html|htm) echo "text/html; charset=utf-8" ;;
+        css)      echo "text/css; charset=utf-8" ;;
+        js|mjs)   echo "application/javascript; charset=utf-8" ;;
+        json)     echo "application/json; charset=utf-8" ;;
+        xml)      echo "application/xml; charset=utf-8" ;;
+        txt)      echo "text/plain; charset=utf-8" ;;
+        svg)      echo "image/svg+xml; charset=utf-8" ;;
+        png)      echo "image/png" ;;
+        jpg|jpeg) echo "image/jpeg" ;;
+        gif)      echo "image/gif" ;;
+        webp)     echo "image/webp" ;;
+        avif)     echo "image/avif" ;;
+        ico)      echo "image/x-icon" ;;
+        woff2)    echo "font/woff2" ;;
+        woff)     echo "font/woff" ;;
+        ttf)      echo "font/ttf" ;;
+        pdf)      echo "application/pdf" ;;
+        mp3)      echo "audio/mpeg" ;;
+        ogg)      echo "audio/ogg" ;;
+        mp4)      echo "video/mp4" ;;
+        webm)     echo "video/webm" ;;
+        *)
+            # Only shell out to `file` when the extension tells us nothing
+            detected=""
+            if command -v file >/dev/null 2>&1; then
+                detected=$(file --mime-type -b "$file" 2>/dev/null)
+            fi
+            case "$detected" in
+                "")      echo "application/octet-stream" ;;
+                text/*)  echo "$detected; charset=utf-8" ;;
+                *)       echo "$detected" ;;
+            esac
+            ;;
+    esac
+}
+
+# Build the files object. One jq pass per file, then one merge.
+# File content goes through a temp file, never through an argument,
+# because argv is capped at ARG_MAX (1MB) and a single photo can exceed it.
 generate_files_json() {
-    local dir="$1"
-    local temp_json=$(mktemp)
-
-    # Start with empty object
-    echo '{}' > "$temp_json"
-
-    # Find all files recursively
-    while IFS= read -r -d '' file; do
-        # Get relative path
-        local rel_path="${file#$dir/}"
-
-        # Skip hidden files and common build artifacts
-        [[ "$rel_path" =~ ^\. ]] && continue
-        [[ "$rel_path" =~ node_modules ]] && continue
-        [[ "$rel_path" =~ \.git ]] && continue
-
-        # Get mime type
-        local mime_type
-        if command -v file >/dev/null 2>&1; then
-            mime_type=$(file --mime-type -b "$file" 2>/dev/null)
-        else
-            mime_type=""
-        fi
-
-        # Fallback mime type detection based on file extension
-        case "${file##*.}" in
-            html|htm) mime_type="text/html" ;;
-            css) mime_type="text/css" ;;
-            js) mime_type="application/javascript" ;;
-            json) mime_type="application/json" ;;
-            png) mime_type="image/png" ;;
-            jpg|jpeg) mime_type="image/jpeg" ;;
-            gif) mime_type="image/gif" ;;
-            svg) mime_type="image/svg+xml" ;;
-            ico) mime_type="image/x-icon" ;;
-            woff2) mime_type="font/woff2" ;;
-            woff) mime_type="font/woff" ;;
-            ttf) mime_type="font/ttf" ;;
-            pdf) mime_type="application/pdf" ;;
-            xml) mime_type="application/xml" ;;
-            txt) mime_type="text/plain" ;;
-            mp3) mime_type="audio/mpeg" ;;
-            mp4) mime_type="video/mp4" ;;
-            webm) mime_type="video/webm" ;;
-            ogg) mime_type="audio/ogg" ;;
-            webp) mime_type="image/webp" ;;
-            avif) mime_type="image/avif" ;;
-            ogg) mime_type="audio/ogg" ;;
-            *)
-                # Use file command result if available, otherwise default
-                if [[ -z "$mime_type" ]]; then
-                    mime_type="application/octet-stream"
-                fi
-                ;;
-        esac
-
-        # Encode file content (universal approach)
-        local content
-        content=$(cat "$file" | base64 | tr -d '\n')
-
-        # Use jq to properly add the file to the JSON object
-        jq --arg path "$rel_path" \
-           --arg content "$content" \
-           --arg mime "$mime_type" \
-           '.[$path] = {"content": $content, "mimeType": $mime}' \
-           "$temp_json" > "${temp_json}.tmp" && mv "${temp_json}.tmp" "$temp_json"
-
-        echo "  $rel_path" >&2
-
-    done < <(find "$dir" -type f -print0)
-
-    # Output the final JSON and clean up
-    cat "$temp_json"
-    rm -f "$temp_json"
+    local dir="$1" list="$2" b64="$3"
+    {
+        local file rel
+        while IFS= read -r -d '' file; do
+            rel="${file#$dir/}"
+            echo "  $rel" >&2
+            base64 < "$file" | tr -d '\n' > "$b64" || exit 1
+            jq -n \
+                --arg path "$rel" \
+                --rawfile content "$b64" \
+                --arg mime "$(mime_type "$file")" \
+                '{($path): {content: ($content | gsub("\n"; "")), mimeType: $mime}}' || exit 1
+        done < "$list"
+    } | jq -c -s 'add // {}'
 }
 
-# Generate Cloudflare Worker script
-generate_worker_script() {
-    local files_json="$1"
+# Write the worker script, streaming the files JSON in rather than
+# holding a multi-megabyte string in the shell
+write_worker_script() {
+    local files_json="$1" out="$2"
+    {
+        printf 'const FILES = '
+        cat "$files_json"
+        printf ';\n'
+        cat << 'EOF'
 
-    cat << 'EOF'
-const FILES = FILES_PLACEHOLDER;
+// Decode each file once, not on every request
+const DECODED = new Map();
 
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request))
-})
-
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  let pathname = url.pathname;
-
-  // Handle root path
-  if (pathname === '/') {
-    pathname = '/index.html';
+function bodyFor(path) {
+  let bytes = DECODED.get(path);
+  if (bytes === undefined) {
+    const binary = atob(FILES[path].content);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    DECODED.set(path, bytes);
   }
-
-  // Remove leading slash for lookup
-  const filePath = pathname.startsWith('/') ? pathname.slice(1) : pathname;
-
-  // Check if file exists
-  if (FILES[filePath]) {
-    const file = FILES[filePath];
-    const content = Uint8Array.from(atob(file.content), c => c.charCodeAt(0));
-
-    return new Response(content, {
-      headers: {
-        'Content-Type': file.mimeType,
-        'Cache-Control': 'public, max-age=3600',
-        'Access-Control-Allow-Origin': '*'
-      }
-    });
-  }
-
-  // Try to serve index.html for SPA routing ONLY for HTML requests (not assets)
-  if (FILES['index.html'] && !filePath.includes('.')) {
-    const file = FILES['index.html'];
-    const content = Uint8Array.from(atob(file.content), c => c.charCodeAt(0));
-
-    return new Response(content, {
-      headers: {
-        'Content-Type': 'text/html',
-        'Cache-Control': 'public, max-age=3600'
-      }
-    });
-  }
-
-  return new Response('File not found: ' + filePath, { status: 404 });
+  return bytes;
 }
+
+export default {
+  fetch(request) {
+    const url = new URL(request.url);
+    let pathname = url.pathname;
+
+    // Handle root path
+    if (pathname === '/') {
+      pathname = '/index.html';
+    }
+
+    // Remove leading slash for lookup
+    const filePath = pathname.startsWith('/') ? pathname.slice(1) : pathname;
+
+    // Check if file exists
+    if (FILES[filePath]) {
+      return new Response(bodyFor(filePath), {
+        headers: {
+          'Content-Type': FILES[filePath].mimeType,
+          'Cache-Control': 'public, max-age=3600',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+
+    // Try to serve index.html for SPA routing ONLY for HTML requests (not assets)
+    if (FILES['index.html'] && !filePath.includes('.')) {
+      return new Response(bodyFor('index.html'), {
+        headers: {
+          'Content-Type': FILES['index.html'].mimeType,
+          'Cache-Control': 'public, max-age=3600'
+        }
+      });
+    }
+
+    return new Response('File not found: ' + filePath, { status: 404 });
+  }
+};
 EOF
+    } > "$out"
 }
 
 # Deploy worker using Cloudflare API
 deploy_worker() {
-    local worker_name="$1"
-    local script="$2"
-    local subdomain="$3"
+    local worker_name="$1" script_file="$2" subdomain="$3"
 
     echo "🚀 Deploying worker..."
 
-    # Upload worker script
+    # Multipart upload reads the script from disk, so size is not capped by ARG_MAX
     local response
-    response=$(curl -s -X PUT \
-        "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$worker_name" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-        -H "Content-Type: application/javascript" \
-        --data "$script")
+    response=$(cf_api -X PUT "$CF_API/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$worker_name" \
+        -F "metadata={\"main_module\":\"worker.js\",\"compatibility_date\":\"$WORKER_COMPAT_DATE\"};type=application/json" \
+        -F "worker.js=@$script_file;filename=worker.js;type=application/javascript+module")
 
-    if ! echo "$response" | jq -e '.success' >/dev/null 2>&1; then
+    if ! api_ok "$response"; then
         echo "❌ Failed to deploy worker:"
-        echo "$response" | jq -r '.errors[]?.message // .error // .'
+        echo "$(api_error "$response")"
         exit 1
     fi
 
     # Create route (ignore if it already exists)
     local route_pattern="$subdomain.$BASE_DOMAIN/*"
     local route_response
-    route_response=$(curl -s -X POST \
-        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/workers/routes" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+    route_response=$(cf_api -X POST "$CF_API/zones/$CLOUDFLARE_ZONE_ID/workers/routes" \
         -H "Content-Type: application/json" \
         --data "{\"pattern\":\"$route_pattern\",\"script\":\"$worker_name\"}")
 
-    # Only report route errors that aren't "already exists"
-    if ! echo "$route_response" | jq -e '.success' >/dev/null 2>&1; then
+    if ! api_ok "$route_response"; then
         local error_message
-        error_message=$(echo "$route_response" | jq -r '.errors[]?.message // .error // .')
+        error_message=$(api_error "$route_response")
 
         # Ignore "route already exists" errors
         if [[ "$error_message" != *"route with the same pattern already exists"* ]]; then
@@ -321,47 +431,54 @@ deploy_worker() {
     fi
 }
 
-# Ensure DNS record exists
+# Ensure a proxied DNS record exists, so the route can serve the hostname
 ensure_dns_record() {
     local subdomain="$1"
     local record_name="$subdomain.$BASE_DOMAIN"
 
-    # Check if record exists
-    local existing
-    existing=$(curl -s -X GET \
-        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$record_name" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+    local records
+    records=$(cf_list_all "$CF_API/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$record_name") || {
+        echo "❌ Could not read DNS records"
+        exit 1
+    }
 
-    local count
-    count=$(echo "$existing" | jq -r '.result | length')
+    # Any proxied record routes the hostname through Cloudflare, so leave it alone
+    local proxied
+    proxied=$(echo "$records" | jq '[.[] | select(.proxied == true)] | length')
+    [[ "$proxied" -gt 0 ]] && return 0
 
-    if [[ "$count" == "0" ]]; then
-        echo "Creating DNS record..."
+    local total
+    total=$(echo "$records" | jq 'length')
+    if [[ "$total" -gt 0 ]]; then
+        echo "❌ $record_name has DNS records, but none are proxied."
+        echo "   The worker route cannot serve traffic until one is proxied."
+        echo "   Existing: $(echo "$records" | jq -r '[.[] | .type] | join(", ")')"
+        exit 1
+    fi
 
-        local create_response
-        create_response=$(curl -s -X POST \
-            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
-            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data "{\"type\":\"AAAA\",\"name\":\"$record_name\",\"content\":\"100::\",\"proxied\":true}")
+    echo "Creating DNS record..."
+    local create_response
+    create_response=$(cf_api -X POST "$CF_API/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"AAAA\",\"name\":\"$record_name\",\"content\":\"100::\",\"proxied\":true}")
 
-        if ! echo "$create_response" | jq -e '.success' >/dev/null 2>&1; then
-            echo "❌ DNS record creation failed"
-            echo "$create_response" | jq -r '.errors[]?.message // .error // .'
-            exit 1
-        fi
+    if ! api_ok "$create_response"; then
+        echo "❌ DNS record creation failed"
+        echo "$(api_error "$create_response")"
+        exit 1
     fi
 }
 
-# Purge cache
+# Purge cache for one hostname, not the whole zone
 purge_cache() {
+    local host="$1"
     echo "Purging cache..."
-    curl -s -X POST \
-        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+    local response
+    response=$(cf_api -X POST "$CF_API/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
         -H "Content-Type: application/json" \
-        --data '{"purge_everything":true}' \
-        >/dev/null
+        --data "{\"hosts\":[\"$host\"]}")
+
+    api_ok "$response" || echo "  Cache purge failed: $(api_error "$response")"
 }
 
 # List all sites
@@ -371,13 +488,15 @@ list_sites() {
 
     echo "Fetching deployed sites..."
 
-    local response
-    response=$(curl -s -X GET \
-        "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+    local scripts
+    scripts=$(cf_list_all "$CF_API/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts") || {
+        echo "❌ Could not list workers"
+        exit 1
+    }
 
     local sites
-    sites=$(echo "$response" | jq -r ".result[] | select(.id | startswith(\"$WORKER_NAME_PREFIX\")) | .id")
+    sites=$(echo "$scripts" | jq -r --arg prefix "$WORKER_NAME_PREFIX" \
+        '.[] | select(.id | startswith($prefix)) | .id')
 
     if [[ -z "$sites" ]]; then
         echo "No sites deployed yet."
@@ -385,92 +504,186 @@ list_sites() {
     fi
 
     echo "Deployed sites:"
+    local worker_name
     while IFS= read -r worker_name; do
-        local subdomain="${worker_name#$WORKER_NAME_PREFIX}"
-        echo "  https://$subdomain.$BASE_DOMAIN"
+        echo "  https://${worker_name#$WORKER_NAME_PREFIX}.$BASE_DOMAIN"
     done <<< "$sites"
 }
 
 # Deploy current directory
 deploy() {
-    local subdomain_input="$1"
     check_dependencies
     load_config
 
-    local current_dir="$(pwd)"
-    local folder_name="$(basename "$current_dir")"
-
-    # Use folder name if no subdomain specified, otherwise normalise the input
     local subdomain
-    if [[ -z "$subdomain_input" ]]; then
-        subdomain="$folder_name"
-    else
-        subdomain=$(normalise_subdomain "$subdomain_input")
-    fi
-
+    subdomain=$(resolve_subdomain "${1:-}") || exit 1
     local worker_name="$WORKER_NAME_PREFIX$subdomain"
+    local current_dir
+    current_dir="$(pwd)"
 
     echo "🚀 Deploying to $subdomain.$BASE_DOMAIN..."
 
-    # Check if directory has files
-    if [[ -z "$(find "$current_dir" -type f -not -path '*/.*' | head -1)" ]]; then
+    # Walk the tree once and reuse the list
+    local list_file json_file script_file
+    new_tmp; list_file="$TMP_FILE"
+    new_tmp; json_file="$TMP_FILE"
+    new_tmp; script_file="$TMP_FILE"
+
+    collect_files "$current_dir" > "$list_file"
+    if [[ ! -s "$list_file" ]]; then
         echo "❌ No files found in current directory"
         exit 1
     fi
 
-    # Generate files JSON
-    local files_json
-    files_json=$(generate_files_json "$current_dir")
+    new_tmp; local b64_file="$TMP_FILE"
+    if ! generate_files_json "$current_dir" "$list_file" "$b64_file" > "$json_file"; then
+        echo "❌ Failed to package files"
+        exit 1
+    fi
 
-    # Generate worker script
-    local worker_script
-    worker_script=$(generate_worker_script)
-    worker_script="${worker_script/FILES_PLACEHOLDER/$files_json}"
+    # Every collected file must appear in the payload
+    local want got
+    want=$(tr -cd '\0' < "$list_file" | wc -c | tr -d ' ')
+    got=$(jq 'length' "$json_file" 2>/dev/null) || got=0
+    if [[ "$got" != "$want" ]]; then
+        echo "❌ Packaged $got of $want files. Aborting rather than deploy a broken site."
+        exit 1
+    fi
 
-    # Ensure DNS record exists
+    write_worker_script "$json_file" "$script_file"
+
+    local size
+    size=$(wc -c < "$script_file" | tr -d ' ')
+    if [[ "$size" -gt "$WORKER_MAX_BYTES" ]]; then
+        echo "❌ Worker script is $((size / 1000))KB, over the 10MB limit."
+        echo "   Remove large files and try again."
+        exit 1
+    fi
+    if [[ "$size" -gt "$WORKER_WARN_BYTES" ]]; then
+        echo "⚠️  Worker script is $((size / 1000))KB. The free plan limit is 1MB."
+    fi
+
     ensure_dns_record "$subdomain"
-
-    # Deploy worker
-    deploy_worker "$worker_name" "$worker_script" "$subdomain"
-
-    # Purge cache
-    purge_cache
+    deploy_worker "$worker_name" "$script_file" "$subdomain"
+    purge_cache "$subdomain.$BASE_DOMAIN"
 
     echo "✅ Deployed to https://$subdomain.$BASE_DOMAIN"
 }
 
+# Delete the worker routes for a subdomain
+delete_route() {
+    local subdomain="$1" worker_name="$2"
+    local route_pattern="$subdomain.$BASE_DOMAIN/*"
+
+    local routes
+    routes=$(cf_list_all "$CF_API/zones/$CLOUDFLARE_ZONE_ID/workers/routes") || return 1
+
+    local ids
+    ids=$(echo "$routes" | jq -r --arg pattern "$route_pattern" --arg script "$worker_name" \
+        '.[] | select(.pattern == $pattern or .script == $script) | .id')
+    [[ -z "$ids" ]] && return 0
+
+    local failed=0 route_id response
+    while IFS= read -r route_id; do
+        [[ -z "$route_id" ]] && continue
+        response=$(cf_api -X DELETE "$CF_API/zones/$CLOUDFLARE_ZONE_ID/workers/routes/$route_id")
+        if api_ok "$response"; then
+            echo "  Route removed: $route_pattern"
+        else
+            echo "  Route delete failed: $(api_error "$response")"
+            failed=1
+        fi
+    done <<< "$ids"
+
+    return $failed
+}
+
+# Delete the DNS record for a subdomain
+delete_dns_record() {
+    local subdomain="$1"
+    local record_name="$subdomain.$BASE_DOMAIN"
+
+    local records
+    records=$(cf_list_all "$CF_API/zones/$CLOUDFLARE_ZONE_ID/dns_records?name=$record_name") || return 1
+
+    # Only remove the proxy record deploy creates. Leave other records alone.
+    local ids kept
+    ids=$(echo "$records" | jq -r '.[] | select(.type == "AAAA" and .proxied == true) | .id')
+
+    kept=$(echo "$records" | jq -r '[.[] | select(.type != "AAAA" or .proxied != true) | .type] | join(", ")')
+    [[ -n "$kept" ]] && echo "  DNS records kept (not created by so): $kept"
+
+    [[ -z "$ids" ]] && return 0
+
+    local failed=0 record_id response
+    while IFS= read -r record_id; do
+        [[ -z "$record_id" ]] && continue
+        response=$(cf_api -X DELETE "$CF_API/zones/$CLOUDFLARE_ZONE_ID/dns_records/$record_id")
+        if api_ok "$response"; then
+            echo "  DNS record removed: $record_name"
+        else
+            echo "  DNS delete failed: $(api_error "$response")"
+            failed=1
+        fi
+    done <<< "$ids"
+
+    return $failed
+}
+
 # Teardown a site
 teardown() {
-    local subdomain_input="$1"
     check_dependencies
     load_config
 
     local subdomain
-    if [[ -z "$subdomain_input" ]]; then
-        # Use current folder name if no subdomain specified
-        local folder_name="$(basename "$(pwd)")"
-        subdomain="$folder_name"
-    else
-        # Normalise the input to extract subdomain
-        subdomain=$(normalise_subdomain "$subdomain_input")
-    fi
-
+    subdomain=$(resolve_subdomain "${1:-}") || exit 1
     local worker_name="$WORKER_NAME_PREFIX$subdomain"
+    local failed=0
 
     echo "🗑️  Deleting site $subdomain.$BASE_DOMAIN..."
 
-    # Delete worker
-    local response
-    response=$(curl -s -X DELETE \
-        "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$worker_name" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+    # Remove the route first so the worker has no traffic bound to it
+    delete_route "$subdomain" "$worker_name" || failed=1
 
-    if echo "$response" | jq -e '.success' >/dev/null 2>&1; then
+    # Delete worker and its files
+    local response
+    response=$(cf_api -X DELETE "$CF_API/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$worker_name?force=true")
+
+    if api_ok "$response"; then
+        echo "  Worker removed: $worker_name"
+    else
+        local message
+        message=$(api_error "$response")
+        # A missing worker is not an error during teardown
+        if [[ "$message" == *not_found* || "$message" == *"not found"* || "$message" == *"could not be found"* ]]; then
+            echo "  Worker already gone: $worker_name"
+        else
+            echo "  Worker delete failed: $message"
+            failed=1
+        fi
+    fi
+
+    # Remove the DNS record
+    delete_dns_record "$subdomain" || failed=1
+
+    if [[ $failed -eq 0 ]]; then
         echo "✅ Site deleted successfully"
     else
-        echo "❌ Error deleting site:"
-        echo "$response" | jq -r '.errors[]?.message // .error // .'
+        echo "❌ Teardown incomplete. Check the messages above."
+        exit 1
     fi
+}
+
+usage() {
+    echo "Usage: so [command] [options]"
+    echo
+    echo "Commands:"
+    echo "  so            Deploy current folder"
+    echo "  so -d <name>  Deploy with custom subdomain"
+    echo "  so list       List all deployed sites"
+    echo "  so teardown   Delete current folder's site"
+    echo "  so teardown <name>  Delete specific site"
+    echo "  so setup      Configure Cloudflare credentials"
 }
 
 # Main command handling
@@ -482,23 +695,25 @@ case "${1:-}" in
         list_sites
         ;;
     teardown)
-        teardown "$2"
+        teardown "${2:-}"
         ;;
     -d)
+        if [[ -z "${2:-}" ]]; then
+            echo "❌ -d needs a subdomain, e.g. so -d mysite"
+            exit 1
+        fi
         deploy "$2"
         ;;
     "")
         deploy
         ;;
+    -h|--help|help)
+        usage
+        ;;
     *)
-        echo "Usage: so [command] [options]"
+        echo "❌ Unknown command: $1"
         echo
-        echo "Commands:"
-        echo "  so            Deploy current folder"
-        echo "  so -d <name>  Deploy with custom subdomain"
-        echo "  so list       List all deployed sites"
-        echo "  so teardown   Delete current folder's site"
-        echo "  so teardown <name>  Delete specific site"
-        echo "  so setup      Configure Cloudflare credentials"
+        usage
+        exit 1
         ;;
 esac
