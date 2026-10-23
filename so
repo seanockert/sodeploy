@@ -8,9 +8,10 @@ CONFIG_FILE="$CONFIG_DIR/config"
 CF_API="https://api.cloudflare.com/client/v4"
 # Pinned so redeploys keep the same runtime behaviour
 WORKER_COMPAT_DATE="2025-01-01"
-# Free plan worker limit is 1MB, paid is 10MB
-WORKER_WARN_BYTES=1000000
-WORKER_MAX_BYTES=10000000
+# Cloudflare limit is 64 MiB uncompressed on all plans.
+# Warn earlier because large scripts slow startup (1s limit).
+WORKER_WARN_BYTES=10000000
+WORKER_MAX_BYTES=67108864
 
 # Temp files to remove on exit
 TMP_FILES=()
@@ -555,12 +556,12 @@ deploy() {
     local size
     size=$(wc -c < "$script_file" | tr -d ' ')
     if [[ "$size" -gt "$WORKER_MAX_BYTES" ]]; then
-        echo "❌ Worker script is $((size / 1000))KB, over the 10MB limit."
+        echo "❌ Worker script is $((size / 1000))KB, over the 64 MiB limit."
         echo "   Remove large files and try again."
         exit 1
     fi
     if [[ "$size" -gt "$WORKER_WARN_BYTES" ]]; then
-        echo "⚠️  Worker script is $((size / 1000))KB. The free plan limit is 1MB."
+        echo "⚠️  Worker script is $((size / 1000))KB. Large scripts can slow startup."
     fi
 
     ensure_dns_record "$subdomain"
